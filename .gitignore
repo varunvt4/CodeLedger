@@ -1,0 +1,30 @@
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (site tooling, if any)
+node_modules/
+
+# Logs & env
+*.log
+.env
+.env.*
+
+# CodeLedger local data (prompts, commits, code context)
+.ledger/
+
+# Misc
+.DS_Store
+Thumbs.db

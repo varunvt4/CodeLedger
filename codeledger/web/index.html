@@ -204,6 +204,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: var(--s5) 0; }
 .btn:hover { background: var(--surface-2); border-color: var(--border-strong); }
 .btn:active { transform: translateY(0.5px); }
 .btn[disabled], .btn[aria-disabled="true"] { opacity: 0.55; cursor: default; pointer-events: none; }
+.btn[data-requires-local] { color: var(--faint); border-style: dashed; cursor: not-allowed; }
 .btn-primary {
   background: var(--accent-solid); border-color: var(--accent-solid);
   color: var(--on-accent);
@@ -496,6 +497,9 @@ kbd, .kbd {
 .banner.warn .icon { color: var(--warning); }
 .banner.danger { border-color: var(--danger); background: var(--danger-soft); }
 .banner.danger .icon { color: var(--danger); }
+#auto-demo-banner { flex-wrap: wrap; }
+#auto-demo-banner .cmd { padding: 2px 7px; font-size: var(--fs-sm); }
+#auto-demo-banner .banner-text { min-width: 0; }
 
 /* --- skeleton --- */
 .skel {
@@ -1050,6 +1054,15 @@ tr.attr-mixed .ln::before { background: var(--warning); }
     </header>
 
     <main class="content" id="main" tabindex="-1">
+      <div class="banner warn hidden" id="auto-demo-banner" role="status">
+        <svg class="icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="banner-text"><b>Demo data.</b> This is a static preview of CodeLedger. Run it on your machine with <code class="cmd">pip install codeledger</code> &middot; <a href="https://github.com/varunvt4/CodeLedger" target="_blank" rel="noopener noreferrer">github.com/varunvt4/CodeLedger</a></span>
+        <span class="banner-actions">
+          <button class="icon-btn bare" data-action="dismiss-demo-banner" aria-label="Dismiss demo notice" data-tip="Dismiss">
+            <svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </span>
+      </div>
       <div id="banner-slot" aria-live="polite"></div>
       <div id="view" class="view"><!-- views render here --></div>
     </main>
@@ -1125,6 +1138,7 @@ var state = {
     memTab: "lessons", memFilter: "", memLocal: [], memPins: {},
     traceSel: null,
     theme: "system", demo: false,
+    demoAuto: false, demoBannerDismissed: false,
     overviewFailed: false
   },
   inflight: {},          // path -> promise (request de-duplication)
@@ -1431,11 +1445,36 @@ function demoLineReveal(file, lineNo) {
 /* ============================= API ================================== */
 function fetchJson(path) {
   return fetch(path, { cache: "no-store" }).then(function (res) {
-    return res.json().catch(function () { return { error: "unreadable response" }; }).then(function (data) {
+    return res.text().then(function (text) {
+      var data = null, jsonOk = true;
+      try { data = JSON.parse(text); } catch (e) { jsonOk = false; }
+      if (!jsonOk) {
+        var bodyErr = new Error("unreadable response");
+        bodyErr.apiDown = true;
+        throw bodyErr;
+      }
       if (!res.ok) throw new Error((data && data.error) ? data.error : "HTTP " + res.status);
       return data;
     });
+  }, function (err) {
+    if (err) err.apiDown = true;
+    throw err;
   });
+}
+var apiProbe = { ok: false };
+function startAutoDemo() {
+  var first = !state.ui.demoAuto;
+  state.ui.demoAuto = true;
+  state.ui.demo = true;
+  if (first && !state.ui.demoBannerDismissed) {
+    var b = $("#auto-demo-banner");
+    if (b) b.classList.remove("hidden");
+  }
+}
+function backendOnly() {
+  return state.ui.demoAuto
+    ? ' data-requires-local data-tip="Available when running locally."'
+    : "";
 }
 /** GET with in-flight de-duplication; demo mode short-circuits to sample data. */
 function api(path, force) {
@@ -1444,8 +1483,18 @@ function api(path, force) {
     catch (err) { return Promise.reject(err); }
   }
   if (!force && state.inflight[path]) return state.inflight[path];
-  var p = fetchJson(path).then(function (data) { delete state.inflight[path]; return data; },
-    function (err) { delete state.inflight[path]; throw err; });
+  var p = fetchJson(path).then(function (data) {
+    delete state.inflight[path];
+    apiProbe.ok = true;
+    return data;
+  }, function (err) {
+    delete state.inflight[path];
+    if (err && err.apiDown && !apiProbe.ok) {
+      startAutoDemo();
+      try { return demoApi(path); } catch (err2) { throw err2; }
+    }
+    throw err;
+  });
   state.inflight[path] = p;
   return p;
 }
@@ -2030,7 +2079,7 @@ VIEWS.overview = function (root, query) {
   root.innerHTML =
     '<div class="view-head"><div class="vh-text">' +
     "<h1>Overview</h1><p>What the AI wrote, what shipped untested, and what needs you.</p></div>" +
-    '<div class="vh-actions"><button class="btn btn-sm" data-action="refresh-overview">' + ic("refresh", 13) + " Refresh</button></div></div>" +
+    '<div class="vh-actions"><button class="btn btn-sm" data-action="refresh-overview"' + backendOnly() + ">" + ic("refresh", 13) + " Refresh</button></div></div>" +
     '<div id="ov-body">' + skeletonList(3) + "</div>";
 
   var body = $("#ov-body");
@@ -2222,7 +2271,7 @@ VIEWS.timeline = function (root, query) {
     '<div class="view-head"><div class="vh-text"><h1>Timeline</h1>' +
     "<p>Every recorded AI change — prompt, model, tool, decision, status.</p></div>" +
     '<div class="vh-actions">' +
-      '<button class="btn btn-sm" data-action="refresh-entries">' + ic("refresh", 13) + " Refresh</button>" +
+      '<button class="btn btn-sm" data-action="refresh-entries"' + backendOnly() + ">" + ic("refresh", 13) + " Refresh</button>" +
       '<button class="btn btn-sm" data-action="open-palette">' + ic("command", 13) + " Search <kbd>Ctrl K</kbd></button>" +
     "</div></div>" +
 
@@ -2962,7 +3011,7 @@ VIEWS.capsule = function (root) {
     '<div class="view-head"><div class="vh-text"><h1>Capsule</h1>' +
     "<p>One copy-paste blob of context — repo rules, active entries, rejected approaches — for any AI tool.</p></div>" +
     '<div class="vh-actions">' +
-      '<button class="btn btn-sm" data-action="capsule-refresh">' + ic("refresh", 13) + " Regenerate</button>" +
+      '<button class="btn btn-sm" data-action="capsule-refresh"' + backendOnly() + ">" + ic("refresh", 13) + " Regenerate</button>" +
       '<button class="btn btn-sm btn-primary" data-action="capsule-copy"' + ' id="cap-copy">' + ic("copy", 13) + " Copy capsule</button>" +
     "</div></div>" +
     '<div id="cap-body">' + skeletonList(1) + "</div>";
@@ -3138,6 +3187,7 @@ function toggleSidebar(force) {
 }
 function setDemo(on) {
   state.ui.demo = !!on;
+  state.ui.demoAuto = false;
   storeSet("cl.demo", state.ui.demo);
   state.health = null; state.entries = null; state.overview = null;
   state.files = null; state.capsule = null;
@@ -3209,6 +3259,11 @@ var ACTIONS = {
   "demo-on": function () { setDemo(true); },
   "demo-off": function () { setDemo(false); },
   "demo-toggle": function () { setDemo(!state.ui.demo); },
+  "dismiss-demo-banner": function () {
+    state.ui.demoBannerDismissed = true;
+    var b = $("#auto-demo-banner");
+    if (b) b.classList.add("hidden");
+  },
   "mem-tab": function (arg) {
     state.ui.memTab = arg;
     $$("[data-action='mem-tab']").forEach(function (b) {
@@ -3267,6 +3322,11 @@ function onDocClick(ev) {
   var actionEl = t.closest("[data-action]");
   if (actionEl) {
     var name = actionEl.getAttribute("data-action");
+    if (actionEl.hasAttribute("data-requires-local")) {
+      ev.preventDefault();
+      toast("Available when running locally.", "warn");
+      return;
+    }
     if (ACTIONS[name]) {
       ev.preventDefault();
       ACTIONS[name](actionEl.getAttribute("data-arg") || "", actionEl, ev);
@@ -3325,15 +3385,9 @@ function paletteKeydown(ev) {
 }
 
 /* ============================= INIT ================================== */
-/** True when served from a static host (Vercel etc.) instead of `ledger ui`. */
-function isDeployedHost() {
-  var h = location.hostname;
-  return h !== "" && h !== "localhost" && h !== "127.0.0.1" && h !== "[::1]";
-}
 function init() {
   state.ui.theme = resolveThemePref();
   state.ui.demo = !!storeGet("cl.demo", false);
-  if (isDeployedHost()) state.ui.demo = true; // no local server: show labeled sample data
   state.ui.memPins = storeGet("cl.pins", {});
   applyTheme();
 
