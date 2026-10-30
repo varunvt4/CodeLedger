@@ -3325,9 +3325,15 @@ function paletteKeydown(ev) {
 }
 
 /* ============================= INIT ================================== */
+/** True when served from a static host (Vercel etc.) instead of `ledger ui`. */
+function isDeployedHost() {
+  var h = location.hostname;
+  return h !== "" && h !== "localhost" && h !== "127.0.0.1" && h !== "[::1]";
+}
 function init() {
   state.ui.theme = resolveThemePref();
   state.ui.demo = !!storeGet("cl.demo", false);
+  if (isDeployedHost()) state.ui.demo = true; // no local server: show labeled sample data
   state.ui.memPins = storeGet("cl.pins", {});
   applyTheme();
 

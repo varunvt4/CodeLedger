@@ -3,6 +3,9 @@
 Endpoints (all JSON, except the dashboard itself):
   * ``/``                 - the single-file dashboard (inline CSS/JS)
   * ``/api/health``       - repo/name/counts snapshot (always 200)
+  * ``/api/overview``     - dashboard aggregates: AI-vs-human line ratio
+    (bounded git blame), models/tools, tested vs untested, recent entries,
+    daily trend. Cached in memory keyed by HEAD + ledger state.
   * ``/api/entries``      - all ledger entries + aggregate counts
   * ``/api/entry/<id>``   - one entry
   * ``/api/blame``        - ``?file=&line=`` -> CLI blame JSON; without
@@ -20,6 +23,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files as resource_files
@@ -33,7 +37,14 @@ from codeledger.blame import reveal, reveal_to_dict
 from codeledger.errors import LedgerError
 from codeledger.util import console, read_json
 
-__all__ = ["build_server", "run_ui", "ApiError", "api_health", "safe_file"]
+__all__ = [
+    "build_server",
+    "run_ui",
+    "ApiError",
+    "api_health",
+    "api_overview",
+    "safe_file",
+]
 
 INDEX_BYTES: bytes = b""
 _MAX_FILE_BYTES = 512 * 1024
@@ -137,6 +148,308 @@ def api_entries(repo: Path) -> Dict[str, Any]:
         "entries": [e.to_dict() for e in entries],
         "counts": store.counts(entries),
     }
+
+
+# ---------------------------------------------------------------------------
+# Overview (dashboard aggregates): bounded, cached, read-only
+# ---------------------------------------------------------------------------
+
+#: Hard caps so one dashboard load can never hammer git on a huge repo.
+OVERVIEW_MAX_FILES = 200
+OVERVIEW_MAX_FILE_BYTES = 256 * 1024
+OVERVIEW_TIME_BUDGET_S = 4.0
+OVERVIEW_MAX_COMMIT_LOOKUPS = 400
+OVERVIEW_TREND_DAYS = 14
+OVERVIEW_RECENT_ENTRIES = 8
+
+#: Directory names never blamed (vendored, generated, binary-heavy).
+_OVERVIEW_VENDOR_DIRS = frozenset(
+    {
+        "node_modules", "vendor", "dist", "build", ".venv", "venv",
+        "__pycache__", ".next", ".nuxt", "out", "target", "third_party",
+        "site-packages", "coverage", ".tox", ".mypy_cache", ".pytest_cache",
+        ".ruff_cache", ".idea", ".vscode", ".git", store.LEDGER_DIR,
+    }
+)
+
+#: Filename suffixes treated as binary/generated and skipped.
+_OVERVIEW_SKIP_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg",
+    ".pdf", ".zip", ".gz", ".tar", ".whl", ".7z", ".rar",
+    ".exe", ".dll", ".so", ".dylib", ".bin", ".class", ".jar", ".o", ".a",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp3", ".mp4", ".mov", ".avi", ".wav", ".ogg",
+    ".sqlite", ".db", ".pyc", ".pyo", ".pyd",
+    ".min.js", ".min.css", ".map", ".lock", ".sum", ".snap",
+)
+
+#: In-memory overview cache: key -> payload. Small FIFO; invalidated by key.
+_OVERVIEW_CACHE: "Dict[str, Dict[str, Any]]" = {}
+_OVERVIEW_CACHE_MAX = 4
+_OVERVIEW_CACHE_LOCK = threading.Lock()
+
+
+def _overview_cache_key(repo: Path) -> str:
+    """Cache identity: repo + HEAD sha + decisions.jsonl size/mtime."""
+    try:
+        head = gitutil.run_git(["rev-parse", "HEAD"], repo, check=False).strip()
+    except LedgerError:
+        head = "no-head"
+    path = store.entries_path(repo)
+    try:
+        stat = path.stat()
+        ledger_sig = f"{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        ledger_sig = "none"
+    return f"{repo.resolve()}|{head or 'no-head'}|{ledger_sig}"
+
+
+def _overview_skip(rel: str) -> bool:
+    """True for paths the overview blame sweep must never touch."""
+    posix = rel.replace("\\", "/")
+    parts = posix.split("/")
+    for part in parts[:-1]:
+        if part in _OVERVIEW_VENDOR_DIRS or part.endswith(".egg-info"):
+            return True
+    name = parts[-1]
+    if name.startswith(".") or name.endswith("~"):
+        return True
+    lowered = name.lower()
+    return any(lowered.endswith(suffix) for suffix in _OVERVIEW_SKIP_SUFFIXES)
+
+
+def _overview_trend_window() -> List[str]:
+    """ISO dates for the last ``OVERVIEW_TREND_DAYS`` days, oldest first."""
+    import datetime as _dt
+
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    return [
+        (today - _dt.timedelta(days=offset)).isoformat()
+        for offset in range(OVERVIEW_TREND_DAYS - 1, -1, -1)
+    ]
+
+
+def api_overview(repo: Path) -> Dict[str, Any]:
+    """Dashboard aggregates: AI-vs-human line ratio + ledger stats.
+
+    Response shape (always HTTP 200, even without git - then ``git`` is
+    False, ``lines`` is all-zero and the trend is empty):
+
+    ``{head, generated_at, truncated, limits, lines, files_scanned, files,
+    by_model, by_tool, tested, recent, trend}``
+
+    The blame sweep is bounded by file count, file size, commit-lookup
+    budget and wall-clock time; when any bound clips, ``truncated`` is True
+    and ``limits`` echoes the caps that applied. Results are cached in
+    memory keyed by HEAD + the ledger file signature, so a second dashboard
+    load is free. Read-only: every git call is an argument list (never a
+    shell), every path resolves inside the repo, nothing is ever written.
+    """
+    import datetime as _dt
+
+    key = _overview_cache_key(repo)
+    with _OVERVIEW_CACHE_LOCK:
+        cached = _OVERVIEW_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    entries = store.load_entries(repo)
+    counts = store.counts(entries)
+    generated_at = (
+        _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+    )
+    try:
+        head = gitutil.run_git(["rev-parse", "HEAD"], repo, check=False).strip()
+    except LedgerError:
+        head = ""
+    head = head or ""
+
+    entry_by_id = {e.id: e for e in entries}
+    model_entries: Dict[str, int] = {}
+    tool_entries: Dict[str, int] = {}
+    for entry in entries:
+        model_entries[entry.model] = model_entries.get(entry.model, 0) + 1
+        tool_entries[entry.tool] = tool_entries.get(entry.tool, 0) + 1
+    model_lines: Dict[str, int] = {}
+    tool_lines: Dict[str, int] = {}
+
+    days = _overview_trend_window()
+    day_index = {d: i for i, d in enumerate(days)}
+    trend: List[Dict[str, Any]] = [
+        {"date": d, "ai": 0, "human": 0} for d in days
+    ]
+
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "git": False,
+        "head": head,
+        "generated_at": generated_at,
+        "truncated": False,
+        "limits": {
+            "max_files": OVERVIEW_MAX_FILES,
+            "max_file_bytes": OVERVIEW_MAX_FILE_BYTES,
+            "time_budget_s": OVERVIEW_TIME_BUDGET_S,
+            "max_commit_lookups": OVERVIEW_MAX_COMMIT_LOOKUPS,
+        },
+        "lines": {"ai": 0, "human": 0, "mixed": 0, "unknown": 0},
+        "files_scanned": 0,
+        "files": {"ai_only": 0, "human_only": 0, "mixed": 0, "unknown_only": 0},
+        "by_model": [
+            {"model": m, "entries": n, "lines": 0}
+            for m, n in sorted(model_entries.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "by_tool": [
+            {"tool": t, "entries": n, "lines": 0}
+            for t, n in sorted(tool_entries.items(), key=lambda kv: (-kv[1], kv[0]))
+        ],
+        "tested": {
+            "tested": counts.get("tests_included", 0),
+            "untested": max(
+                0, counts.get("total", 0) - counts.get("tests_included", 0)
+            ),
+        },
+        "recent": [e.to_dict() for e in _newest_entries(entries)],
+        "trend": trend,
+    }
+
+    try:
+        root = gitutil.ensure_git_repo(repo)
+    except LedgerError:
+        with _OVERVIEW_CACHE_LOCK:
+            _OVERVIEW_CACHE[key] = payload
+        return payload
+    payload["git"] = True
+
+    try:
+        tracked = gitutil.tracked_files(root)
+    except gitutil.GitError:
+        tracked = []
+
+    # ---- bounded blame sweep -------------------------------------------
+    started = time.monotonic()
+    #: sha -> (trailer ids or None when the budget is exhausted, commit date)
+    commit_cache: Dict[str, Tuple[Optional[List[str]], str]] = {}
+    lookup_budget = OVERVIEW_MAX_COMMIT_LOOKUPS
+    files_ai: List[str] = []
+    files_human: List[str] = []
+    files_mixed: List[str] = []
+    files_unknown: List[str] = []
+    scanned = 0
+    entry_ids_known = set(entry_by_id)
+
+    def commit_facts(sha: str) -> Optional[Tuple[Optional[List[str]], str]]:
+        """(trailer ids, commit date) for ``sha``; None = budget exhausted."""
+        nonlocal lookup_budget
+        if sha in commit_cache:
+            return commit_cache[sha]
+        if lookup_budget <= 0:
+            return None
+        lookup_budget -= 1
+        try:
+            info = gitutil.commit_info(root, sha)
+        except gitutil.GitError:
+            commit_cache[sha] = ([], "")
+            return commit_cache[sha]
+        commit_cache[sha] = (list(info.trailer_ids), info.date)
+        return commit_cache[sha]
+
+    def bump_trend(day: str, side: str) -> None:
+        idx = day_index.get(day[:10])
+        if idx is not None:
+            trend[idx][side] += 1
+
+    def bump_attribution(ids: List[str]) -> None:
+        """Count one AI line against the model/tool of its first known entry."""
+        for entry_id in ids:
+            entry = entry_by_id.get(entry_id)
+            if entry is None:
+                continue
+            model_lines[entry.model] = model_lines.get(entry.model, 0) + 1
+            tool_lines[entry.tool] = tool_lines.get(entry.tool, 0) + 1
+            return
+
+    for rel in tracked:
+        if scanned >= OVERVIEW_MAX_FILES or (
+            time.monotonic() - started > OVERVIEW_TIME_BUDGET_S
+        ):
+            payload["truncated"] = True
+            break
+        if _overview_skip(rel):
+            continue
+        target = root / rel
+        try:
+            if not target.is_file() or target.stat().st_size > OVERVIEW_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        try:
+            blocks = gitutil.blame_file(root, rel)
+        except gitutil.GitError:
+            continue  # vanished/binary: skip, never fail the page
+        scanned += 1
+        file_ai = file_human = file_mixed = file_unknown = 0
+        for block in blocks.values():
+            if block.uncommitted:
+                payload["lines"]["unknown"] += 1
+                file_unknown += 1
+                continue
+            facts = commit_facts(block.sha)
+            if facts is None:  # lookup budget gone: honest unknown
+                payload["truncated"] = True
+                payload["lines"]["unknown"] += 1
+                file_unknown += 1
+                continue
+            ids, commit_day = facts
+            if not ids:
+                payload["lines"]["human"] += 1
+                file_human += 1
+                if commit_day:
+                    bump_trend(commit_day, "human")
+            elif all(i in entry_ids_known for i in ids):
+                payload["lines"]["ai"] += 1
+                file_ai += 1
+                bump_attribution(ids)
+                if commit_day:
+                    bump_trend(commit_day, "ai")
+            else:  # Ledger-ID trailer present but the entry is missing
+                payload["lines"]["mixed"] += 1
+                file_mixed += 1
+        if file_ai and not file_human and not file_mixed:
+            files_ai.append(rel)
+        elif file_human and not file_ai and not file_mixed:
+            files_human.append(rel)
+        elif file_ai or file_mixed:
+            files_mixed.append(rel)
+        elif file_unknown:
+            files_unknown.append(rel)
+
+    payload["files_scanned"] = scanned
+    payload["files"] = {
+        "ai_only": len(files_ai),
+        "human_only": len(files_human),
+        "mixed": len(files_mixed),
+        "unknown_only": len(files_unknown),
+        "ai_paths": files_ai[:20],
+        "mixed_paths": (files_mixed + files_ai)[:20],
+    }
+    #: Merge swept line totals into the by_model / by_tool rows.
+    for row in payload["by_model"]:
+        row["lines"] = model_lines.get(row["model"], 0)
+    for row in payload["by_tool"]:
+        row["lines"] = tool_lines.get(row["tool"], 0)
+
+    with _OVERVIEW_CACHE_LOCK:
+        while len(_OVERVIEW_CACHE) >= _OVERVIEW_CACHE_MAX:
+            _OVERVIEW_CACHE.pop(next(iter(_OVERVIEW_CACHE)))
+        _OVERVIEW_CACHE[key] = payload
+    return payload
+
+
+def _newest_entries(
+    entries: List[store.Entry], limit: int = OVERVIEW_RECENT_ENTRIES
+) -> List[store.Entry]:
+    """Newest-first entries (stable id tiebreak), capped for the payload."""
+    return sorted(entries, key=lambda e: (e.timestamp, e.number), reverse=True)[:limit]
 
 
 def api_blame_line(repo: Path, file: str, line: int) -> Dict[str, Any]:
@@ -327,6 +640,8 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ApiError(404, "not found")
             if path_name == "/api/health":
                 self._send(api_health(self.repo))
+            elif path_name == "/api/overview":
+                self._send(api_overview(self.repo))
             elif path_name == "/api/entries":
                 self._send(api_entries(self.repo))
             elif path_name.startswith("/api/entry/"):
